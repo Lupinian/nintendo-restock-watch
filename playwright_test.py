@@ -4,7 +4,7 @@ from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeo
 
 URL = (
     "https://store-jp.nintendo.com/item/goods/"
-    "VM_NSJ_8_AFAC4"
+    "VM_MNS_8_MAAAA"
 )
 
 def main():
