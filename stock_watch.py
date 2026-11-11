@@ -2,9 +2,13 @@
 import json
 import os
 import sys
+import time
 from html.parser import HTMLParser
 from pathlib import Path
+from urllib.parse import urlsplit
 from urllib.request import Request, urlopen
+
+from playwright.sync_api import sync_playwright
 
 STATE_FILE = Path("stock_state.json")
 NTFY_TOPIC = os.environ.get("NTFY_TOPIC", "").strip()
@@ -38,6 +42,8 @@ PRODUCTS = [
 
 
 class CartButtonParser(HTMLParser):
+    """旧方式との互換用ではなく、ボタン状態の判定基準を明確にするための定義。"""
+
     def __init__(self):
         super().__init__()
         self.in_button = False
@@ -65,66 +71,80 @@ class CartButtonParser(HTMLParser):
             self.in_button = False
 
 
-def check_stock(product):
-    request = Request(
-        product["check_url"],
-        headers={
-            "User-Agent": (
-                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                "AppleWebKit/605.1.15 (KHTML, like Gecko) "
-                "Version/17.0 Safari/605.1.15"
-            ),
-            "Accept-Language": "ja-JP,ja;q=0.9",
-        },
+def check_stock(browser, product):
+    started = time.monotonic()
+    page = browser.new_page(
+        locale="ja-JP",
+        viewport={"width": 1280, "height": 900},
     )
 
-    with urlopen(request, timeout=20) as response:
-        print("HTTP status:", response.status)
-        print("Final URL:", response.geturl())
-        print("Content-Type:", response.headers.get("Content-Type"))
-        html = response.read().decode("utf-8", errors="replace")
+    try:
+        print(f"ページ取得開始: {product['name']}")
 
-    print("HTML length:", len(html))
-    print("HTML preview:", html[:800])
-
-    # AkamaiなどのJavaScript確認ページを検出
-    if (
-        "store-jp-wr.nintendo.com" in request.full_url
-        or "kupver=akamai" in html
-        or "JavaScriptを有効にする必要" in html
-    ):
-        raise RuntimeError(
-            "JavaScript/Akamai確認ページが返されました。"
-            "商品ページのHTMLを取得できていません。"
+        response = page.goto(
+            product["check_url"],
+            wait_until="domcontentloaded",
+            timeout=90000,
         )
 
-    parser = CartButtonParser()
-    parser.feed(html)
+        if response is not None:
+            print(f"HTTP status: {response.status}")
 
-    if not parser.found:
-        raise RuntimeError(
-            "購入ボタンが見つかりません。"
-            "商品ページのHTMLを取得できていない可能性があります。"
+            if response.status >= 400:
+                raise RuntimeError(
+                    f"商品ページの取得に失敗しました: HTTP {response.status}"
+                )
+
+        button = page.locator("#productDetail_CartButton")
+
+        # JavaScriptによるページ遷移後、購入ボタンが現れるまで待つ
+        button.wait_for(
+            state="attached",
+            timeout=60000,
         )
 
-    text = "".join(parser.parts).strip()
-    attrs = parser.attrs
+        text = button.inner_text().strip()
+        disabled = button.is_disabled()
 
-    if "品切れ" in text:
-        return "out_of_stock"
+        print(f"ページタイトル: {page.title()}")
+        print(f"ボタン表示: {text}")
+        print(f"無効状態: {disabled}")
 
-    disabled = (
-        "disabled" in attrs
-        or str(attrs.get("aria-disabled", "")).lower() == "true"
-    )
+        if "品切れ" in text:
+            status = "out_of_stock"
 
-    if "カートに入れる" in text and not disabled:
-        return "in_stock"
+        elif "カートに入れる" in text and not disabled:
+            status = "in_stock"
 
-    raise RuntimeError(
-        f"判定できないボタン状態です: text={text!r}, "
-        f"disabled={disabled}"
-    )
+        else:
+            raise RuntimeError(
+                f"判定できないボタン状態です: "
+                f"text={text!r}, disabled={disabled}"
+            )
+
+        elapsed = time.monotonic() - started
+        print(f"取得時間: {elapsed:.1f}秒")
+
+        return status
+
+    except Exception:
+        # エラー時は原因調査に必要な情報だけを記録
+        safe_url = urlsplit(page.url)._replace(
+            query="", fragment=""
+        ).geturl()
+
+        print(f"取得時のURL: {safe_url}")
+
+        try:
+            body = page.locator("body").inner_text(timeout=5000)
+            print(f"ページ本文（先頭500文字）: {body[:500]}")
+        except Exception:
+            print("ページ本文を取得できませんでした。")
+
+        raise
+
+    finally:
+        page.close()
 
 
 def send_notification(product, new_status):
@@ -183,32 +203,43 @@ def main():
     updated = previous.copy()
     errors = False
 
-    for product in PRODUCTS:
-        key = product["key"]
+    # Chromiumは1回だけ起動し、2商品を順番に確認する
+    with sync_playwright() as playwright:
+        browser = playwright.chromium.launch(headless=True)
 
         try:
-            current = check_stock(product)
-            old = previous.get(key)
+            for product in PRODUCTS:
+                key = product["key"]
 
-            print(f"{product['name']}: {current}")
+                try:
+                    current = check_stock(browser, product)
+                    old = previous.get(key)
 
-            if old is None:
-                print("初回チェック：通知せず状態を記録します。")
-                updated[key] = current
+                    print(f"{product['name']}: {current}")
 
-            elif old != current:
-                print(f"状態変化: {old} -> {current}")
+                    if old is None:
+                        print(
+                            "初回チェック：通知せず状態を記録します。"
+                        )
+                        updated[key] = current
 
-                send_notification(product, current)
-                updated[key] = current
-                print("通知を送信しました。")
+                    elif old != current:
+                        print(f"状態変化: {old} -> {current}")
 
-            else:
-                print("状態変化なし。通知は送りません。")
+                        # 通知成功後にのみ状態を更新
+                        send_notification(product, current)
+                        updated[key] = current
+                        print("通知を送信しました。")
 
-        except Exception as error:
-            errors = True
-            print(f"ERROR [{key}]: {error}")
+                    else:
+                        print("状態変化なし。通知は送りません。")
+
+                except Exception as error:
+                    errors = True
+                    print(f"ERROR [{key}]: {error}")
+
+        finally:
+            browser.close()
 
     if updated != previous:
         STATE_FILE.write_text(
