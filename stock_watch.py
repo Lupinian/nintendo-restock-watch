@@ -87,6 +87,7 @@ with urlopen(request, timeout=20) as response:
 
 print("HTML length:", len(html))
 print("HTML preview:", html[:800])
+
     parser = CartButtonParser()
     parser.feed(html)
 
