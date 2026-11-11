@@ -78,22 +78,33 @@ def check_stock(product):
         },
     )
 
-with urlopen(request, timeout=20) as response:
-    print("HTTP status:", response.status)
-    print("Final URL:", response.geturl())
-    print("Content-Type:", response.headers.get("Content-Type"))
+    with urlopen(request, timeout=20) as response:
+        print("HTTP status:", response.status)
+        print("Final URL:", response.geturl())
+        print("Content-Type:", response.headers.get("Content-Type"))
+        html = response.read().decode("utf-8", errors="replace")
 
-    html = response.read().decode("utf-8", errors="replace")
+    print("HTML length:", len(html))
+    print("HTML preview:", html[:800])
 
-print("HTML length:", len(html))
-print("HTML preview:", html[:800])
+    # AkamaiなどのJavaScript確認ページを検出
+    if (
+        "store-jp-wr.nintendo.com" in request.full_url
+        or "kupver=akamai" in html
+        or "JavaScriptを有効にする必要" in html
+    ):
+        raise RuntimeError(
+            "JavaScript/Akamai確認ページが返されました。"
+            "商品ページのHTMLを取得できていません。"
+        )
 
     parser = CartButtonParser()
     parser.feed(html)
 
     if not parser.found:
         raise RuntimeError(
-            "購入ボタンが見つかりません。HTML構造を確認してください。"
+            "購入ボタンが見つかりません。"
+            "商品ページのHTMLを取得できていない可能性があります。"
         )
 
     text = "".join(parser.parts).strip()
@@ -182,14 +193,12 @@ def main():
             print(f"{product['name']}: {current}")
 
             if old is None:
-                # 初回は通知せず、現在の状態を基準値として保存
                 print("初回チェック：通知せず状態を記録します。")
                 updated[key] = current
 
             elif old != current:
                 print(f"状態変化: {old} -> {current}")
 
-                # 通知成功後にのみ状態を更新
                 send_notification(product, current)
                 updated[key] = current
                 print("通知を送信しました。")
