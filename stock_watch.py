@@ -78,9 +78,15 @@ def check_stock(product):
         },
     )
 
-    with urlopen(request, timeout=20) as response:
-        html = response.read().decode("utf-8", errors="replace")
+with urlopen(request, timeout=20) as response:
+    print("HTTP status:", response.status)
+    print("Final URL:", response.geturl())
+    print("Content-Type:", response.headers.get("Content-Type"))
 
+    html = response.read().decode("utf-8", errors="replace")
+
+print("HTML length:", len(html))
+print("HTML preview:", html[:800])
     parser = CartButtonParser()
     parser.feed(html)
 
